@@ -37,7 +37,8 @@
              address :: inet:ip_address(),
              port    :: inet:port_number(),
              prefix  :: string(),
-             type_map :: [{list(atom()), atom()}]}).
+             type_map :: [{list(atom()), atom()}],
+             tags :: map()}).
 
 %%%===================================================================
 %%% Probe callbacks
@@ -51,18 +52,19 @@ exometer_init(Opts) ->
     Port       = port(Opts),
     TypeMap    = get_opt(type_map, Opts, []),
     Prefix     = get_opt(prefix, Opts, []),
+    Tags       = tags(Opts),
 
     case gen_udp:open(0, [AddrType]) of
     {ok, Sock} ->
         {ok, #st{socket=Sock, address=IP, port=Port, type_map=TypeMap,
-             prefix=Prefix}};
+             prefix=Prefix, tags=Tags}};
     {error, _} = Error ->
         Error
     end.
 
 
 exometer_report(Metric, DataPoint, Extra, Value, #st{type_map = TypeMap,
-                             prefix = Pfx} = St) ->
+                             prefix = Pfx, tags = Tags} = St) ->
     Key = metric_key(Metric, DataPoint),
     Name = name(Pfx, Metric, DataPoint),
     ?debug("Report metric ~p = ~p~n", [Name, Value]),
@@ -70,7 +72,7 @@ exometer_report(Metric, DataPoint, Extra, Value, #st{type_map = TypeMap,
                {ok, T} -> T;
                error -> gauge
            end,
-    Line = [Name, ":", value(Value), "|", type(Type)],
+    Line = [Name, ":", value(Value), "|", type(Type), build_tags_segment(Tags)],
     case gen_udp:send(St#st.socket, St#st.address, St#st.port, Line) of
         ok ->
             {ok, St};
@@ -127,6 +129,13 @@ port(Opts) ->
     T -> T
   end.
 
+tags(Opts) ->
+  case get_opt(tags, Opts, #{}) of
+    {system, T} ->
+      jiffy:decode(from_env(T), [use_nil, return_maps]);
+    T -> T
+  end.
+
 from_env(Config) ->
   case os:getenv(Config) of
     false -> nil;
@@ -138,7 +147,7 @@ type(counter) -> "c";
 type(timer) -> "ms";
 type(histogram) -> "h";
 type(meter) -> "m";
-type(set) -> "s". %% datadog specific type, see http://docs.datadoghq.com/guides/dogstatsd/#tags
+type(set) -> "s". %% DataDog specific type, see: https://docs.datadoghq.com/guides/dogstatsd/#sets
 
 metric_key(Metric,DataPoint) -> metric_key([],Metric,DataPoint).
 
@@ -148,6 +157,28 @@ metric_key(Pfx, Metric, DataPoint) -> [ Pfx | Metric ] ++ [ DataPoint ].
 name(Prefix, Metric, DataPoint) ->
     intersperse(".", lists:map(fun thing_to_list/1,
                                metric_key(Prefix, Metric, DataPoint))).
+
+%% datadog specific feature, see: https://docs.datadoghq.com/guides/dogstatsd/#metrics-1
+build_tags_segment(nil) -> [];
+build_tags_segment(Tags) ->
+    maps:fold(fun (Key, Val, []) ->
+                      ["|#", kv(Key, Val)];
+                  (Key, Val, Acc) ->
+                      [Acc, ",", kv(Key, Val)]
+              end,
+              [],
+              Tags).
+
+kv(K, V) when is_atom(K) ->
+    kv(atom_to_list(K), V);
+kv(K, V) when is_atom(V) ->
+    kv(K, atom_to_list(V));
+kv(K, V) when is_number(K) ->
+    kv(io_lib:format("~b", [K]), V);
+kv(K, V) when is_number(V) ->
+    kv(K, io_lib:format("~b", [V]));
+kv(K, V) ->
+    [K, $:, V].
 
 thing_to_list(X) when is_atom(X) -> atom_to_list(X);
 thing_to_list(X) when is_integer(X) -> integer_to_list(X);
